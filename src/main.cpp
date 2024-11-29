@@ -58,9 +58,10 @@ class AccelerometerSensor
 private:
     Adafruit_MPU6050 accelerometer;
     unsigned int stepCount = 0;
-    float threshold = 20;
+    unsigned int temperature = 0;
+    float threshold = 18;
     unsigned long lastStepTime = 0;
-    unsigned long debounceTime = 300;
+    unsigned long debounceTime = 1000;
     float offsetX = 0, offsetY = 0;
 
     void calculateOffsets()
@@ -133,6 +134,23 @@ public:
     {
         return stepCount;
     }
+
+    unsigned int getTemperature()
+    {
+        sensors_event_t a, g, temp;
+        accelerometer.getEvent(&a, &g, &temp);
+        return temp.temperature;
+    }
+
+    unsigned int getAcceloremeterMagnitude()
+    {
+        sensors_event_t a, g, temp;
+        accelerometer.getEvent(&a, &g, &temp);
+        return sqrt(
+            (a.acceleration.x - offsetX) * (a.acceleration.x - offsetX) +
+            (a.acceleration.y - offsetY) * (a.acceleration.y - offsetY) +
+            a.acceleration.z * a.acceleration.z);
+    }
 };
 
 class LCDDisplay
@@ -149,14 +167,17 @@ public:
         lcd.backlight();
     }
 
-    void printMessage(unsigned int pulse, unsigned int row, unsigned int col, String message)
+    void printMessage(unsigned int pulse, unsigned int pulseOx, unsigned int steps, String activityType, unsigned int row, unsigned int col, String message)
     {
         lcd.clear();
         lcd.setCursor(col, row);
         lcd.print(message.c_str());
-        lcd.setCursor(0, 3);
-        String pulseMessage = String(pulse) + " lpm";
+        lcd.setCursor(0, 1);
+        String pulseMessage = String(pulse) + " lpm / SpO2:" + String(pulseOx) + "%";
         lcd.print(pulseMessage);
+        lcd.setCursor(0, 2);
+        String stepsMessage = "Pasos: " + String(steps) + "/" + activityType;
+        lcd.print(stepsMessage);
     }
 };
 
@@ -182,7 +203,7 @@ protected:
         }
         else
         {
-            Serial.println("Error deserializando el mensaje JSON");
+            Serial.println("Error parsing JSON");
         }
     }
 
@@ -238,17 +259,23 @@ public:
 class ExerciseBand : public MQTTClient
 {
 protected:
-    const char *UPDATE_TOPIC = "$aws/things/exerciseband/shadow/update";
-    const char *UPDATE_DELTA_TOPIC = "$aws/things/exerciseband/shadow/update/delta";
+    const char *UPDATE_TOPIC = "$aws/things/smartband_0001/shadow/update";
+    const char *UPDATE_DELTA_TOPIC = "$aws/things/smartband_0001/shadow/update/delta";
 
     unsigned int pulse = 0;
-    unsigned int currentState = 0;
-    unsigned int minPulseAlert = 60;
-    unsigned int maxPulseAlert = 200;
+    unsigned int bloodOxygen = 0;
+    unsigned int steps = 0;
+    unsigned int temperature = 0;
+    String activityType = "Reposo";
+    unsigned int accelerometerMagnitude = 0;
+    unsigned int currentState = -1;
+    unsigned int lastStepsReported = 0;
+    unsigned int minPulseAlert = 70;
+    unsigned int maxPulseAlert = 150;
     String message = "";
 
-    StaticJsonDocument<JSON_OBJECT_SIZE(64)> outputDoc;
-    char outputBuffer[128];
+    StaticJsonDocument<JSON_OBJECT_SIZE(512)> outputDoc;
+    char outputBuffer[512];
 
 public:
     ExerciseBand(const char *broker, int port) : MQTTClient(broker, port) {}
@@ -266,7 +293,7 @@ public:
             if (inputDoc["state"]["data_requested"] == 1)
             {
                 publishPulseRequestAttended();
-                updatePulseInShadow();
+                updateDataInShadow();
             }
             if (inputDoc["state"]["min_pulse_alert"] > 0)
             {
@@ -287,14 +314,14 @@ public:
         Serial.println("Suscribed to topic: " + String(UPDATE_DELTA_TOPIC));
     }
 
-    void updatePulseInShadow()
+    void updateDataInShadow()
     {
         outputDoc.clear();
         outputDoc["state"]["reported"]["heart_rate"] = pulse;
-        outputDoc["state"]["reported"]["SpO2"] = 98; //////
-        outputDoc["state"]["reported"]["activity_type"] = 'Actividad'; //////
-        outputDoc["state"]["reported"]["enviroment_temperature"] = 25; //////
-        outputDoc["state"]["reported"]["steps"] = 50;     //////
+        outputDoc["state"]["reported"]["SpO2"] = bloodOxygen;
+        outputDoc["state"]["reported"]["activity_type"] = activityType;
+        outputDoc["state"]["reported"]["enviroment_temperature"] = temperature;
+        outputDoc["state"]["reported"]["steps"] = steps;
 
         serializeJson(outputDoc, outputBuffer);
         client.publish(UPDATE_TOPIC, outputBuffer);
@@ -341,17 +368,52 @@ public:
         return 2;
     }
 
-    void reportStateIfChanged(unsigned int pulse)
+    String getNewActivityType()
+    {
+        const int stepThreshold = 18;
+        const int reposePulseThreshold = 60;
+        const int exercisePulseThreshold = 120;
+
+        if (accelerometerMagnitude < stepThreshold && pulse < reposePulseThreshold)
+        {
+            return "Reposo";
+        }
+        else if (accelerometerMagnitude >= stepThreshold && pulse < exercisePulseThreshold)
+        {
+            return "Movimiento";
+        }
+        else if (accelerometerMagnitude >= stepThreshold && pulse >= exercisePulseThreshold)
+        {
+            return "Ejercicio";
+        }
+        return "Reposo";
+    }
+
+    void reportData(unsigned int pulse, unsigned int pulseOx, unsigned int steps, unsigned int temperature, unsigned int accelerometerMagnitude)
     {
         this->pulse = pulse;
-        if (getNewState() != currentState)
+        this->bloodOxygen = pulseOx;
+        this->steps = steps;
+        this->temperature = temperature;
+        this->accelerometerMagnitude = accelerometerMagnitude;
+        if (getNewState() != currentState || steps - lastStepsReported > 200 || getNewActivityType() != activityType)
         {
+            Serial.print("Publishing new state: ");
             currentState = getNewState();
+            activityType = getNewActivityType();
+            Serial.print(activityType);
+            lastStepsReported = steps;
             outputDoc.clear();
             outputDoc["state"]["reported"]["heart_rate_state"] = currentState;
+            outputDoc["state"]["reported"]["heart_rate"] = pulse;
+            outputDoc["state"]["reported"]["SpO2"] = bloodOxygen;
+            outputDoc["state"]["reported"]["activity_type"] = activityType;
+            outputDoc["state"]["reported"]["enviroment_temperature"] = temperature;
+            outputDoc["state"]["reported"]["steps"] = steps;
+
             serializeJson(outputDoc, outputBuffer);
             client.publish(UPDATE_TOPIC, outputBuffer);
-            Serial.print("Publicado nuevo estado: ");
+            Serial.print("New state published: ");
             Serial.println(currentState);
         }
     }
@@ -359,6 +421,11 @@ public:
     String getMessage()
     {
         return message;
+    }
+
+    String getActivityType()
+    {
+        return activityType;
     }
 };
 
@@ -368,7 +435,6 @@ ExerciseBand exerciseBand(MQTT_BROKER, MQTT_PORT);
 LCDDisplay lcd;
 AccelerometerSensor accelerometer;
 
-// Time at which the last beat occurred
 uint32_t tsLastReport = 0;
 
 PulseOximeterSensor pulseOximeter;
@@ -400,7 +466,12 @@ void loop()
     {
         unsigned int pulse = pulseOximeter.getHeartRate();
         unsigned int pulseOx = pulseOximeter.getSpO2();
-        exerciseBand.reportStateIfChanged(pulse);
+        unsigned int steps = accelerometer.getStepCount();
+        unsigned int temperature = accelerometer.getTemperature();
+        unsigned int accelerometerMagnitude = accelerometer.getAcceloremeterMagnitude();
+        Serial.print("Accelerometer magnitude: ");
+        Serial.println(accelerometerMagnitude);
+        exerciseBand.reportData(pulse, pulseOx, steps, temperature, accelerometerMagnitude);
         Serial.print("Heart rate:");
         Serial.print(pulse);
         Serial.print("bpm / SpO2:");
@@ -408,7 +479,8 @@ void loop()
         Serial.println("%");
 
         tsLastReport = millis();
-        lcd.printMessage(pulse, 0, 0, exerciseBand.getMessage());
+
+        lcd.printMessage(pulse, pulseOx, steps, exerciseBand.getActivityType(), 0, 0, exerciseBand.getMessage());
 
         Serial.print("Step count: ");
         Serial.println(accelerometer.getStepCount());
