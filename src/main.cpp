@@ -15,6 +15,126 @@
 
 #define REPORTING_PERIOD_MS 600
 
+class PulseOximeterSensor
+{
+private:
+    PulseOximeter pox;
+
+    static void onBeatDetected()
+    {
+        Serial.println("Beat detected!");
+    }
+
+public:
+    void init()
+    {
+        while (!pox.begin())
+        {
+            Serial.println("FAILED to initialize pulse oximeter!");
+        }
+        Serial.println("SUCCESS to initialize pulse oximeter!");
+        pox.setIRLedCurrent(MAX30100_LED_CURR_46_8MA);
+        pox.setOnBeatDetectedCallback(onBeatDetected);
+    }
+
+    void update()
+    {
+        pox.update();
+    }
+
+    float getHeartRate()
+    {
+        return pox.getHeartRate();
+    }
+
+    uint8_t getSpO2()
+    {
+        return pox.getSpO2();
+    }
+};
+
+class AccelerometerSensor
+{
+private:
+    Adafruit_MPU6050 accelerometer;
+    unsigned int stepCount = 0;
+    float threshold = 20;
+    unsigned long lastStepTime = 0;
+    unsigned long debounceTime = 300;
+    float offsetX = 0, offsetY = 0;
+
+    void calculateOffsets()
+    {
+        const int numReadings = 100;
+        float sumX = 0, sumY = 0, sumZ = 0;
+
+        Serial.println("Calculating offsets...");
+
+        for (int i = 0; i < numReadings; i++)
+        {
+            sensors_event_t a, g, temp;
+            accelerometer.getEvent(&a, &g, &temp);
+
+            sumX += a.acceleration.x;
+            sumY += a.acceleration.y;
+
+            delay(10);
+        }
+
+        offsetX = sumX / numReadings;
+        offsetY = sumY / numReadings;
+
+        Serial.print("Offset X: ");
+        Serial.println(offsetX);
+        Serial.print("Offset Y: ");
+        Serial.println(offsetY);
+    }
+
+public:
+    void init()
+    {
+        while (!accelerometer.begin())
+        {
+            Serial.println("Failed to find MPU6050 chip");
+            delay(10);
+        }
+
+        Serial.println("MPU6050 Found!");
+        accelerometer.setAccelerometerRange(MPU6050_RANGE_8_G);
+        accelerometer.setGyroRange(MPU6050_RANGE_500_DEG);
+        accelerometer.setFilterBandwidth(MPU6050_BAND_5_HZ);
+        calculateOffsets();
+    }
+
+    void update_steps()
+    {
+        sensors_event_t a, g, temp;
+        accelerometer.getEvent(&a, &g, &temp);
+        float magnitude = sqrt(
+            (a.acceleration.x - offsetX) * (a.acceleration.x - offsetX) +
+            (a.acceleration.y - offsetY) * (a.acceleration.y - offsetY) +
+            a.acceleration.z * a.acceleration.z);
+        // Serial.print('magnitude ');
+        // Serial.println(magnitude);
+
+        if (magnitude > threshold)
+        {
+            unsigned long currentTime = millis();
+            if (currentTime - lastStepTime > debounceTime)
+            {
+                stepCount++;
+                lastStepTime = currentTime;
+                Serial.print("Step detected!");
+            }
+        }
+    }
+
+    unsigned int getStepCount()
+    {
+        return stepCount;
+    }
+};
+
 class LCDDisplay
 {
 private:
@@ -40,12 +160,13 @@ public:
     }
 };
 
-class MQTTClient{
-    protected:
+class MQTTClient
+{
+protected:
     WiFiClientSecure wiFiClient;
     PubSubClient client;
-    
-void callback(char *topic, byte *payload, unsigned int length)
+
+    void callback(char *topic, byte *payload, unsigned int length)
     {
         String message;
         for (unsigned int i = 0; i < length; i++)
@@ -67,6 +188,7 @@ void callback(char *topic, byte *payload, unsigned int length)
 
     virtual void onMessageReceived(const String &topic, StaticJsonDocument<200> inputDoc) = 0;
     virtual void subscribeTopics() = 0;
+
 public:
     MQTTClient(const char *broker, int port) : client(wiFiClient)
     {
@@ -115,7 +237,7 @@ public:
 
 class ExerciseBand : public MQTTClient
 {
-    protected:
+protected:
     const char *UPDATE_TOPIC = "$aws/things/exerciseband/shadow/update";
     const char *UPDATE_DELTA_TOPIC = "$aws/things/exerciseband/shadow/update/delta";
 
@@ -128,36 +250,35 @@ class ExerciseBand : public MQTTClient
     StaticJsonDocument<JSON_OBJECT_SIZE(64)> outputDoc;
     char outputBuffer[128];
 
-    public:
-
+public:
     ExerciseBand(const char *broker, int port) : MQTTClient(broker, port) {}
 
     void onMessageReceived(const String &topic, StaticJsonDocument<200> inputDoc) override
     {
         Serial.println("Message received from: " + topic);
-            if (String(topic) == UPDATE_DELTA_TOPIC)
+        if (String(topic) == UPDATE_DELTA_TOPIC)
+        {
+            if (inputDoc["state"]["message"])
             {
-                if (inputDoc["state"]["message"])
-                {
-                    message = inputDoc["state"]["message"].as<String>();
-                    reportMessage();
-                }
-                if (inputDoc["state"]["pulse_requested"] == 1)
-                {
-                    publishPulseRequestAttended();
-                    updatePulseInShadow();
-                }
-                if (inputDoc["state"]["min_pulse_alert"] > 0)
-                {
-                    minPulseAlert = inputDoc["state"]["min_pulse_alert"];
-                    reportMinPulseParameter();
-                }
-                if (inputDoc["state"]["max_pulse_alert"] > 0)
-                {
-                    maxPulseAlert = inputDoc["state"]["max_pulse_alert"];
-                    reportMaxPulseParameter();
-                }
+                message = inputDoc["state"]["message"].as<String>();
+                reportMessage();
             }
+            if (inputDoc["state"]["data_requested"] == 1)
+            {
+                publishPulseRequestAttended();
+                updatePulseInShadow();
+            }
+            if (inputDoc["state"]["min_pulse_alert"] > 0)
+            {
+                minPulseAlert = inputDoc["state"]["min_pulse_alert"];
+                reportMinPulseParameter();
+            }
+            if (inputDoc["state"]["max_pulse_alert"] > 0)
+            {
+                maxPulseAlert = inputDoc["state"]["max_pulse_alert"];
+                reportMaxPulseParameter();
+            }
+        }
     }
 
     void subscribeTopics() override
@@ -165,11 +286,16 @@ class ExerciseBand : public MQTTClient
         client.subscribe(UPDATE_DELTA_TOPIC);
         Serial.println("Suscribed to topic: " + String(UPDATE_DELTA_TOPIC));
     }
-    
+
     void updatePulseInShadow()
     {
         outputDoc.clear();
         outputDoc["state"]["reported"]["heart_rate"] = pulse;
+        outputDoc["state"]["reported"]["SpO2"] = 98; //////
+        outputDoc["state"]["reported"]["activity_type"] = 'Actividad'; //////
+        outputDoc["state"]["reported"]["enviroment_temperature"] = 25; //////
+        outputDoc["state"]["reported"]["steps"] = 50;     //////
+
         serializeJson(outputDoc, outputBuffer);
         client.publish(UPDATE_TOPIC, outputBuffer);
     }
@@ -177,7 +303,7 @@ class ExerciseBand : public MQTTClient
     void publishPulseRequestAttended()
     {
         outputDoc.clear();
-        outputDoc["state"]["desired"]["pulse_requested"] = 0;
+        outputDoc["state"]["desired"]["data_requested"] = 0;
         serializeJson(outputDoc, outputBuffer);
         client.publish(UPDATE_TOPIC, outputBuffer);
     }
@@ -233,137 +359,60 @@ class ExerciseBand : public MQTTClient
     String getMessage()
     {
         return message;
-    }    
+    }
 };
-
-
-
 
 WiFiConnection wifi(WIFI_SSID, WIFI_PASS);
 ExerciseBand exerciseBand(MQTT_BROKER, MQTT_PORT);
 
 LCDDisplay lcd;
-Adafruit_MPU6050 mpu;
-// Parameters for step counting
-float threshold = 9.5;   // Adjust based on testing
-unsigned long lastStepTime = 0;
-int stepCount = 0;
-unsigned long debounceTime = 300; // Minimum time (ms) between steps
-float offsetX = 0, offsetY = 0;
-void calculateOffsets() {
-  const int numReadings = 100;
-  float sumX = 0, sumY = 0;
-
-  Serial.println("Calculating offsets...");
-
-  for (int i = 0; i < numReadings; i++) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-
-    sumX += a.acceleration.x;
-    sumY += a.acceleration.y;
-
-    delay(10);
-  }
-
-  offsetX = sumX / numReadings;
-  offsetY = sumY / numReadings;
-
-  Serial.print("Offset X: ");
-  Serial.println(offsetX);
-  Serial.print("Offset Y: ");
-  Serial.println(offsetY);
-}
-
-
-// Create a PulseOximeter object
-PulseOximeter pox;
+AccelerometerSensor accelerometer;
 
 // Time at which the last beat occurred
 uint32_t tsLastReport = 0;
 
-// Callback routine is executed when a pulse is detected
-void onBeatDetected() {
-    Serial.println("Beat!");
-}
+PulseOximeterSensor pulseOximeter;
 
-void setup() {
+void setup()
+{
     Serial.begin(115200);
-   wifi.connect(WIFI_POWER_5dBm);
-   lcd.init();
+    wifi.connect(WIFI_POWER_5dBm);
+    lcd.init();
+    accelerometer.init();
 
-     while (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050 chip");
-    delay(10);
-  }
-  Serial.println("MPU6050 Found!");
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-     mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
-     calculateOffsets();
-    
     exerciseBand.setCertificates(AMAZON_ROOT_CA1, CERTIFICATE, PRIVATE_KEY);
     exerciseBand.connectMQTT();
 
-    Serial.print("Initializing pulse oximeter..");
-
-    // Initialize sensor
-    if (!pox.begin()) {
-        Serial.println("FAILED");
-        for(;;);
-    } else {
-        Serial.println("SUCCESS");
-    }
-  pox.setIRLedCurrent(MAX30100_LED_CURR_46_8MA);
-
-    // Register a callback routine
-    pox.setOnBeatDetectedCallback(onBeatDetected);
-
-    
-   
-
+    pulseOximeter.init();
 }
 
-void loop() {
+void loop()
+{
     if (!exerciseBand.isConnected())
     {
         exerciseBand.connectMQTT();
     }
     exerciseBand.loop();
-    // Read from the sensor
 
-    pox.update();
+    pulseOximeter.update();
 
-    // Grab the updated heart rate and SpO2 levels
-    if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
-        unsigned int pulse = pox.getHeartRate();
+    if (millis() - tsLastReport > REPORTING_PERIOD_MS)
+    {
+        unsigned int pulse = pulseOximeter.getHeartRate();
+        unsigned int pulseOx = pulseOximeter.getSpO2();
         exerciseBand.reportStateIfChanged(pulse);
         Serial.print("Heart rate:");
         Serial.print(pulse);
         Serial.print("bpm / SpO2:");
-        Serial.print(pox.getSpO2());
+        Serial.print(pulseOx);
         Serial.println("%");
 
         tsLastReport = millis();
         lcd.printMessage(pulse, 0, 0, exerciseBand.getMessage());
+
+        Serial.print("Step count: ");
+        Serial.println(accelerometer.getStepCount());
     }
 
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    float magnitude = sqrt(
-    (a.acceleration.x - offsetX) * (a.acceleration.x - offsetX)+
-    (a.acceleration.y- offsetY) * (a.acceleration.y - offsetY) +
-    a.acceleration.z * a.acceleration.z
-  );
-  Serial.print("magnituide: ");
-  Serial.println(magnitude);
-  if (magnitude > threshold) {
-    unsigned long currentTime = millis();
-    if (currentTime - lastStepTime > debounceTime) {
-      stepCount++;
-      lastStepTime = currentTime;
-      Serial.print("Step detected! Total steps: ");
-      Serial.println(stepCount);
-    }
-  }
+    accelerometer.update_steps();
 }
