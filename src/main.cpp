@@ -12,6 +12,7 @@
 #include <Adafruit_Sensor.h>
 
 #include "config.h"
+#include "Utilities.h"
 
 #define REPORTING_PERIOD_MS 600
 
@@ -53,6 +54,8 @@ public:
     }
 };
 
+#define DEBOUNCE_TIME 1000
+
 class AccelerometerSensor
 {
 private:
@@ -61,7 +64,6 @@ private:
     unsigned int temperature = 0;
     float threshold = 18;
     unsigned long lastStepTime = 0;
-    unsigned long debounceTime = 1000;
     float offsetX = 0, offsetY = 0;
 
     void calculateOffsets()
@@ -107,7 +109,7 @@ public:
         calculateOffsets();
     }
 
-    void update_steps()
+    void updateSteps()
     {
         sensors_event_t a, g, temp;
         accelerometer.getEvent(&a, &g, &temp);
@@ -121,7 +123,7 @@ public:
         if (magnitude > threshold)
         {
             unsigned long currentTime = millis();
-            if (currentTime - lastStepTime > debounceTime)
+            if (currentTime - lastStepTime > DEBOUNCE_TIME)
             {
                 stepCount++;
                 lastStepTime = currentTime;
@@ -139,7 +141,7 @@ public:
     {
         sensors_event_t a, g, temp;
         accelerometer.getEvent(&a, &g, &temp);
-        return temp.temperature;
+        return temp.temperature - 5;
     }
 
     unsigned int getAcceloremeterMagnitude()
@@ -267,11 +269,10 @@ protected:
     unsigned int steps = 0;
     unsigned int temperature = 0;
     String activityType = "Reposo";
-    unsigned int accelerometerMagnitude = 0;
     unsigned int currentState = -1;
     unsigned int lastStepsReported = 0;
-    unsigned int minPulseAlert = 70;
-    unsigned int maxPulseAlert = 150;
+    unsigned int minPulseAlert = 60;
+    unsigned int maxPulseAlert = 200;
     String message = "";
 
     StaticJsonDocument<JSON_OBJECT_SIZE(512)> outputDoc;
@@ -292,7 +293,7 @@ public:
             }
             if (inputDoc["state"]["data_requested"] == 1)
             {
-                publishPulseRequestAttended();
+                publishDataRequestAttended();
                 updateDataInShadow();
             }
             if (inputDoc["state"]["min_pulse_alert"] > 0)
@@ -320,14 +321,14 @@ public:
         outputDoc["state"]["reported"]["heart_rate"] = pulse;
         outputDoc["state"]["reported"]["SpO2"] = bloodOxygen;
         outputDoc["state"]["reported"]["activity_type"] = activityType;
-        outputDoc["state"]["reported"]["enviroment_temperature"] = temperature;
+        outputDoc["state"]["reported"]["environment_temperature"] = temperature;
         outputDoc["state"]["reported"]["steps"] = steps;
 
         serializeJson(outputDoc, outputBuffer);
         client.publish(UPDATE_TOPIC, outputBuffer);
     }
 
-    void publishPulseRequestAttended()
+    void publishDataRequestAttended()
     {
         outputDoc.clear();
         outputDoc["state"]["desired"]["data_requested"] = 0;
@@ -368,12 +369,16 @@ public:
         return 2;
     }
 
-    String getNewActivityType()
+    String getNewActivityType(unsigned int accelerometerMagnitude)
     {
         const int stepThreshold = 18;
-        const int reposePulseThreshold = 60;
+        const int reposePulseThreshold = 70;
         const int exercisePulseThreshold = 120;
-
+        
+        Serial.print("Accelerometer magnitude: ");
+        Serial.println(accelerometerMagnitude);
+        Serial.print("pulsr: ");
+        Serial.println(pulse);
         if (accelerometerMagnitude < stepThreshold && pulse < reposePulseThreshold)
         {
             return "Reposo";
@@ -395,20 +400,19 @@ public:
         this->bloodOxygen = pulseOx;
         this->steps = steps;
         this->temperature = temperature;
-        this->accelerometerMagnitude = accelerometerMagnitude;
-        if (getNewState() != currentState || steps - lastStepsReported > 200 || getNewActivityType() != activityType)
+        if (getNewState() != currentState || steps - lastStepsReported > 200 || getNewActivityType(accelerometerMagnitude) != activityType)
         {
-            Serial.print("Publishing new state: ");
+
             currentState = getNewState();
-            activityType = getNewActivityType();
-            Serial.print(activityType);
             lastStepsReported = steps;
+            activityType = getNewActivityType(accelerometerMagnitude);
+            
             outputDoc.clear();
             outputDoc["state"]["reported"]["heart_rate_state"] = currentState;
             outputDoc["state"]["reported"]["heart_rate"] = pulse;
             outputDoc["state"]["reported"]["SpO2"] = bloodOxygen;
             outputDoc["state"]["reported"]["activity_type"] = activityType;
-            outputDoc["state"]["reported"]["enviroment_temperature"] = temperature;
+            outputDoc["state"]["reported"]["environment_temperature"] = temperature;
             outputDoc["state"]["reported"]["steps"] = steps;
 
             serializeJson(outputDoc, outputBuffer);
@@ -462,29 +466,26 @@ void loop()
 
     pulseOximeter.update();
 
-    if (millis() - tsLastReport > REPORTING_PERIOD_MS)
-    {
+    Utilities::nonBlockingDelay(REPORTING_PERIOD_MS, []()
+                                {
         unsigned int pulse = pulseOximeter.getHeartRate();
         unsigned int pulseOx = pulseOximeter.getSpO2();
         unsigned int steps = accelerometer.getStepCount();
         unsigned int temperature = accelerometer.getTemperature();
         unsigned int accelerometerMagnitude = accelerometer.getAcceloremeterMagnitude();
-        Serial.print("Accelerometer magnitude: ");
-        Serial.println(accelerometerMagnitude);
         exerciseBand.reportData(pulse, pulseOx, steps, temperature, accelerometerMagnitude);
+
+        
         Serial.print("Heart rate:");
         Serial.print(pulse);
         Serial.print("bpm / SpO2:");
         Serial.print(pulseOx);
         Serial.println("%");
-
-        tsLastReport = millis();
-
-        lcd.printMessage(pulse, pulseOx, steps, exerciseBand.getActivityType(), 0, 0, exerciseBand.getMessage());
-
         Serial.print("Step count: ");
         Serial.println(accelerometer.getStepCount());
-    }
 
-    accelerometer.update_steps();
+        lcd.printMessage(pulse, pulseOx, steps, exerciseBand.getActivityType(), 0, 0, exerciseBand.getMessage());
+        });
+
+    accelerometer.updateSteps();
 }
